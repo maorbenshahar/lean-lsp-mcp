@@ -46,6 +46,7 @@ from lean_lsp_mcp.models import (
     InteractiveDiagnosticsResult,
     FileOutline,
     GoalState,
+    GoalTrackerResult,
     HoverInfo,
     LeanFinderResult,
     LeanFinderResults,
@@ -1220,6 +1221,125 @@ def verify_theorem(
             ]
 
     return VerifyResult(axioms=axioms, warnings=w)
+
+
+@mcp.tool(
+    "lean_goal_tracker",
+    annotations=ToolAnnotations(
+        title="Goal Tracker",
+        readOnlyHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def goal_tracker(
+    ctx: Context,
+    file_path: Annotated[str, Field(description="Absolute path to Lean file")],
+    decl_name: Annotated[
+        str,
+        Field(
+            description="Declaration name to check (must be defined in the file)"
+        ),
+    ],
+) -> GoalTrackerResult:
+    """Check if a declaration transitively depends on sorry. Searches all transitive dependencies."""
+    from lean_lsp_mcp.goal_tracker import make_sorry_snippet, parse_sorry_result, render_tree
+
+    rel_path = setup_client_for_file(ctx, file_path)
+    if not rel_path:
+        raise LeanToolError(
+            "Invalid Lean file path: Unable to start LSP server or load file"
+        )
+
+    client: LeanLSPClient = ctx.request_context.lifespan_context.client
+    client.open_file(rel_path)
+
+    try:
+        original_content = client.get_file_content(rel_path)
+    except Exception:
+        original_content = get_file_contents(file_path)
+
+    # Resolve short names via document symbols (e.g. "quantum_deFinetti" -> "QuantumDeFinetti.quantum_deFinetti")
+    resolved_name = decl_name
+    if "." not in decl_name:
+        try:
+            symbols = client.get_document_symbols(rel_path)
+            if symbols:
+                from lean_lsp_mcp.outline_utils import _flatten_symbols
+
+                suffix = "." + decl_name
+                flat = _flatten_symbols(symbols, content=original_content)
+                candidates = [
+                    sym.get("name", "")
+                    for sym, _ in flat
+                    if sym.get("name", "").endswith(suffix)
+                    or sym.get("name", "") == decl_name
+                ]
+                if len(candidates) == 1:
+                    resolved_name = candidates[0]
+                elif len(candidates) > 1:
+                    raise LeanToolError(
+                        f"Ambiguous name '{decl_name}', matches: {candidates}"
+                    )
+        except LeanToolError:
+            raise
+        except Exception:
+            pass  # Fall through with original name
+
+    snippet = make_sorry_snippet(resolved_name)
+    original_lines = original_content.split("\n")
+    appended_line = len(original_lines)  # 0-indexed line where snippet starts
+
+    try:
+        change = DocumentContentChange(
+            snippet,
+            [appended_line, 0],
+            [appended_line, 0],
+        )
+        client.update_file(rel_path, [change])
+        raw = client.get_diagnostics(
+            rel_path, start_line=appended_line, inactivity_timeout=120.0
+        )
+        check_lsp_response(raw, "get_diagnostics")
+
+        appended_diags = list(raw)
+
+        # Check for errors in the appended snippet
+        errors = [
+            d.get("message", "") for d in appended_diags if d.get("severity") == 1
+        ]
+        if errors:
+            raise LeanToolError(
+                f"Goal tracker failed: {'; '.join(errors)}"
+            )
+
+        nodes, total_visited = parse_sorry_result(appended_diags)
+    finally:
+        if original_content is not None:
+            try:
+                client.update_file_content(rel_path, original_content)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore `%s` after goal_tracker: %s", rel_path, exc
+                )
+            try:
+                client.open_file(rel_path, force_reopen=True)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to force-reopen `%s` after goal_tracker: %s",
+                    rel_path,
+                    exc,
+                )
+
+    sorry_names = list(nodes.keys())
+    tree_lines = render_tree(decl_name, nodes) if nodes else []
+
+    return GoalTrackerResult(
+        target=decl_name,
+        sorry_declarations=sorry_names,
+        tree="\n".join(tree_lines),
+        total_transitive_deps=total_visited,
+    )
 
 
 class LocalSearchError(Exception):

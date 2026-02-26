@@ -285,6 +285,21 @@ class CodeActionsResult(BaseModel):
     )
 
 
+class GoalTrackerResult(BaseModel):
+    target: str = Field(description="Declaration that was checked")
+    sorry_declarations: List[str] = Field(
+        default_factory=list,
+        description="Declaration names that transitively depend on sorry",
+    )
+    tree: str = Field(
+        "",
+        description="ASCII dependency tree showing sorry propagation paths",
+    )
+    total_transitive_deps: int = Field(
+        description="Total number of transitive dependencies checked"
+    )
+
+
 class SourceWarning(BaseModel):
     line: int = Field(description="Line number (1-indexed)")
     pattern: str = Field(description="Matched pattern text")
