@@ -1237,13 +1237,15 @@ def goal_tracker(
     file_path: Annotated[str, Field(description="Absolute path to Lean file")],
     decl_name: Annotated[
         str,
-        Field(
-            description="Declaration name to check (must be defined in the file)"
-        ),
+        Field(description="Declaration name to check (must be defined in the file)"),
     ],
 ) -> GoalTrackerResult:
     """Check if a declaration transitively depends on sorry. Searches all transitive dependencies."""
-    from lean_lsp_mcp.goal_tracker import make_sorry_snippet, parse_sorry_result, render_tree
+    from lean_lsp_mcp.goal_tracker import (
+        make_sorry_snippet,
+        parse_sorry_result,
+        render_tree,
+    )
 
     rel_path = setup_client_for_file(ctx, file_path)
     if not rel_path:
@@ -1287,6 +1289,7 @@ def goal_tracker(
             pass  # Fall through with original name
 
     snippet = make_sorry_snippet(resolved_name)
+    snippet_lines = snippet.count("\n")
     original_lines = original_content.split("\n")
     appended_line = len(original_lines)  # 0-indexed line where snippet starts
 
@@ -1309,27 +1312,21 @@ def goal_tracker(
             d.get("message", "") for d in appended_diags if d.get("severity") == 1
         ]
         if errors:
-            raise LeanToolError(
-                f"Goal tracker failed: {'; '.join(errors)}"
-            )
+            raise LeanToolError(f"Goal tracker failed: {'; '.join(errors)}")
 
         nodes, total_visited = parse_sorry_result(appended_diags)
     finally:
-        if original_content is not None:
-            try:
-                client.update_file_content(rel_path, original_content)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to restore `%s` after goal_tracker: %s", rel_path, exc
-                )
-            try:
-                client.open_file(rel_path, force_reopen=True)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to force-reopen `%s` after goal_tracker: %s",
-                    rel_path,
-                    exc,
-                )
+        try:
+            restore_change = DocumentContentChange(
+                "",
+                [appended_line, 0],
+                [appended_line + snippet_lines, 0],
+            )
+            client.update_file(rel_path, [restore_change])
+        except Exception as exc:
+            logger.warning(
+                "Failed to restore `%s` after goal_tracker: %s", rel_path, exc
+            )
 
     sorry_names = list(nodes.keys())
     tree_lines = render_tree(decl_name, nodes) if nodes else []
