@@ -54,6 +54,8 @@ from lean_lsp_mcp.models import (
     LeanSearchResults,
     LocalSearchResult,
     LocalSearchResults,
+    LongProofEntry,
+    LongProofResults,
     LoogleResult,
     LoogleResults,
     MultiAttemptResult,
@@ -1397,6 +1399,42 @@ async def local_search(
         return LocalSearchResults(items=results)
     except RuntimeError as exc:
         raise LocalSearchError(f"Search failed: {exc}")
+
+
+@mcp.tool(
+    "lean_long_proofs",
+    annotations=ToolAnnotations(
+        title="Long Proofs",
+        readOnlyHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+async def long_proofs(
+    ctx: Context,
+    file_path: Annotated[
+        str, Field(description="Absolute path to a .lean file or directory to scan")
+    ],
+    warn_threshold: Annotated[
+        int, Field(description="Minimum proof lines to report", ge=1)
+    ] = 30,
+) -> LongProofResults:
+    """Find long tactic proofs. Scans for `theorem`/`lemma`/`def`/`instance` declarations with `:= by` blocks exceeding the line threshold."""
+    if not _RG_AVAILABLE:
+        raise LeanToolError(_RG_MESSAGE)
+
+    from lean_lsp_mcp.long_proof_utils import find_long_proofs
+
+    scan_path = Path(file_path).expanduser().resolve()
+    if not scan_path.exists():
+        raise LeanToolError(f"Path does not exist: {file_path}")
+
+    entries, files_scanned = await asyncio.to_thread(
+        find_long_proofs, scan_path, warn_threshold,
+    )
+
+    items = [LongProofEntry(**e) for e in entries]
+    return LongProofResults(items=items, files_scanned=files_scanned)
 
 
 @mcp.tool(

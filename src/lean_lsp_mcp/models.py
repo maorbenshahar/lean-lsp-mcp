@@ -285,6 +285,23 @@ class CodeActionsResult(BaseModel):
     )
 
 
+class LongProofEntry(BaseModel):
+    name: str = Field(description="Declaration name (or instance@LINE for anonymous)")
+    kind: str = Field(description="Declaration keyword (theorem, lemma, def, instance)")
+    file: str = Field(description="Relative file path")
+    line: int = Field(description="Declaration start line (1-indexed)")
+    line_count: int = Field(description="Number of lines in the proof body")
+    have_count: int = Field(description="Number of `have` statements")
+    calc_count: int = Field(description="Number of `calc` blocks")
+
+
+class LongProofResults(BaseModel):
+    items: List[LongProofEntry] = Field(
+        default_factory=list, description="Long proof entries, sorted by line count descending"
+    )
+    files_scanned: int = Field(description="Number of .lean files scanned")
+
+
 class GoalTrackerResult(BaseModel):
     target: str = Field(description="Declaration that was checked")
     sorry_declarations: List[str] = Field(
