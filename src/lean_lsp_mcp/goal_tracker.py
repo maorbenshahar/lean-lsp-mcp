@@ -36,7 +36,8 @@ set_option maxHeartbeats 800000
 open Lean Lean.Elab.Command in
 #eval show CommandElabM Unit from do
   let env ← getEnv
-  let target : Name := "{decl_name}".splitOn "." |>.foldl (fun n s => n.str s) .anonymous
+  let mkN (n : Name) (s : String) : Name := if let some k := s.toNat? then n.num k else n.str s
+  let target : Name := "{decl_name}".splitOn "." |>.foldl mkN .anonymous
   if (env.find? target).isNone then throwError "not found: {decl_name}"
   -- BFS: compute visited set and per-node direct constants
   let mut visited : NameSet := .empty

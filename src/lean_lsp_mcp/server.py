@@ -1266,6 +1266,9 @@ def goal_tracker(
     # Resolve short names by scanning file text for namespace/end blocks.
     # Document symbols are unreliable (LSP truncates large files), so we parse
     # the source directly to find which namespace the declaration lives in.
+    # Private declarations get mangled by Lean to:
+    #   _private.<module_dotpath>.0.<namespace>.<name>
+    # We detect `private` in the source and construct the mangled FQN.
     resolved_name = decl_name
     if "." not in decl_name:
         try:
@@ -1289,12 +1292,20 @@ def goal_tracker(
                     # Strip leading modifiers/attributes to find the core keyword
                     words = s.split()
                     idx = 0
+                    is_private = False
                     while idx < len(words) and (words[idx] in _modifiers or words[idx].startswith("@[")):
+                        if words[idx] == "private":
+                            is_private = True
                         idx += 1
                     if idx < len(words) and words[idx] in _core_keywords and idx + 1 < len(words):
                         name_part = words[idx + 1].rstrip(":({[")
                         if name_part == decl_name:
                             fqn = ".".join(ns_stack + [decl_name]) if ns_stack else decl_name
+                            if is_private:
+                                # Lean mangles private decls as:
+                                #   _private.<module_dotpath>.0.<fqn>
+                                module_dotpath = rel_path.removesuffix(".lean").replace("/", ".").replace("\\", ".")
+                                fqn = f"_private.{module_dotpath}.0.{fqn}"
                             candidates.append(fqn)
             if len(candidates) == 1:
                 resolved_name = candidates[0]

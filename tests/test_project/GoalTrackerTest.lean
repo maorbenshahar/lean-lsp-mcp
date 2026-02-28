@@ -44,3 +44,23 @@ def gt_shared_sorry : Nat := sorry
 def gt_path_left : Nat := gt_shared_sorry + 1
 def gt_path_right : Nat := gt_shared_sorry + 2
 theorem gt_diamond : gt_path_left + gt_path_right > 0 := by sorry
+
+-- 12. Namespaced declarations for name resolution testing
+namespace GtNs
+theorem ns_clean : 1 + 1 = 2 := by norm_num
+theorem ns_sorry : 1 + 1 = 3 := by sorry
+private def ns_private_sorry : Nat := sorry
+theorem ns_uses_private : ns_private_sorry = ns_private_sorry := by rfl
+end GtNs
+
+-- 13. Nested namespaces
+namespace GtOuter
+namespace GtInner
+theorem nested_sorry : False := by sorry
+end GtInner
+end GtOuter
+
+-- 14. Section (should not affect FQN)
+section GtSection
+theorem gt_in_section : 1 + 1 = 2 := by norm_num
+end GtSection

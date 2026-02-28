@@ -52,6 +52,12 @@ GROUND_TRUTH = {
     "gt_sorry_a":            (True,  ["gt_sorry_a"],              "sorry source A"),
     "gt_sorry_b":            (True,  ["gt_sorry_b"],              "sorry source B"),
     "gt_multi_sorry":        (True,  ["gt_sorry_a", "gt_sorry_b"], "multiple sorry sources converging"),
+    "gt_diamond":            (True,  ["gt_shared_sorry"],          "diamond: shared sorry dep via two paths"),
+    "GtNs.ns_clean":         (False, [],                          "namespaced clean theorem"),
+    "GtNs.ns_sorry":         (True,  ["GtNs.ns_sorry"],           "namespaced sorry theorem"),
+    "GtNs.ns_uses_private":  (True,  [],                          "uses private sorry def transitively"),
+    "GtOuter.GtInner.nested_sorry": (True, ["GtOuter.GtInner.nested_sorry"], "nested namespace sorry"),
+    "gt_in_section":         (False, [],                          "theorem in section, no namespace effect"),
 }
 
 
@@ -110,6 +116,59 @@ async def test_goal_tracker_matches_ground_truth(
             assert data["total_transitive_deps"] > 0, (
                 f"goal_tracker {decl} ({desc}): expected deps > 0, got {data}"
             )
+
+
+@pytest.mark.asyncio
+async def test_goal_tracker_short_name_resolution(
+    mcp_client_factory: Callable[[], AsyncContextManager[MCPClient]],
+    test_project_path: Path,
+) -> None:
+    """goal_tracker resolves short names to FQNs via namespace scanning."""
+    gt_file = test_project_path / "GoalTrackerTest.lean"
+    async with mcp_client_factory() as client:
+        # Short name "ns_sorry" should resolve to GtNs.ns_sorry
+        result = await client.call_tool(
+            "lean_goal_tracker",
+            {"file_path": str(gt_file), "decl_name": "ns_sorry"},
+        )
+        data = result_json(result)
+        assert data["target"] == "ns_sorry"
+        assert len(data["sorry_declarations"]) >= 1
+        assert data["total_transitive_deps"] > 0
+
+
+@pytest.mark.asyncio
+async def test_goal_tracker_nonexistent_short_name(
+    mcp_client_factory: Callable[[], AsyncContextManager[MCPClient]],
+    test_project_path: Path,
+) -> None:
+    """Short name that doesn't exist in the file — error."""
+    gt_file = test_project_path / "GoalTrackerTest.lean"
+    async with mcp_client_factory() as client:
+        result = await client.call_tool(
+            "lean_goal_tracker",
+            {"file_path": str(gt_file), "decl_name": "totally_nonexistent_xyz"},
+            expect_error=True,
+        )
+        assert result.isError
+
+
+@pytest.mark.asyncio
+async def test_goal_tracker_section_no_namespace_effect(
+    mcp_client_factory: Callable[[], AsyncContextManager[MCPClient]],
+    test_project_path: Path,
+) -> None:
+    """Theorem in a section — FQN should not include section name."""
+    gt_file = test_project_path / "GoalTrackerTest.lean"
+    async with mcp_client_factory() as client:
+        result = await client.call_tool(
+            "lean_goal_tracker",
+            {"file_path": str(gt_file), "decl_name": "gt_in_section"},
+        )
+        data = result_json(result)
+        assert data["target"] == "gt_in_section"
+        assert data["sorry_declarations"] == []
+        assert data["total_transitive_deps"] > 0
 
 
 @pytest.mark.asyncio
