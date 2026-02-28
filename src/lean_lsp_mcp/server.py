@@ -1263,27 +1263,49 @@ def goal_tracker(
     except Exception:
         original_content = get_file_contents(file_path)
 
-    # Resolve short names via document symbols (e.g. "quantum_deFinetti" -> "QuantumDeFinetti.quantum_deFinetti")
+    # Resolve short names by scanning file text for namespace/end blocks.
+    # Document symbols are unreliable (LSP truncates large files), so we parse
+    # the source directly to find which namespace the declaration lives in.
     resolved_name = decl_name
     if "." not in decl_name:
         try:
-            symbols = client.get_document_symbols(rel_path)
-            if symbols:
-                from lean_lsp_mcp.outline_utils import _flatten_symbols
-
-                suffix = "." + decl_name
-                flat = _flatten_symbols(symbols, content=original_content)
-                candidates = [
-                    sym.get("name", "")
-                    for sym, _ in flat
-                    if sym.get("name", "").endswith(suffix)
-                    or sym.get("name", "") == decl_name
-                ]
-                if len(candidates) == 1:
-                    resolved_name = candidates[0]
-                elif len(candidates) > 1:
+            content_for_resolve = original_content
+            lines_for_resolve = content_for_resolve.splitlines()
+            ns_stack: list[str] = []
+            _modifiers = {"private", "protected", "noncomputable", "nonrec",
+                          "unsafe", "partial", "@[simp]", "@[inline]"}
+            _core_keywords = {"theorem", "lemma", "def", "abbrev", "instance",
+                              "inductive", "structure", "class"}
+            candidates: list[str] = []
+            for src_line in lines_for_resolve:
+                s = src_line.strip()
+                if s.startswith("namespace "):
+                    ns_stack.append(s[len("namespace "):].strip())
+                elif s.startswith("end "):
+                    ended = s[len("end "):].strip()
+                    if ns_stack and ns_stack[-1] == ended:
+                        ns_stack.pop()
+                else:
+                    # Strip leading modifiers/attributes to find the core keyword
+                    words = s.split()
+                    idx = 0
+                    while idx < len(words) and (words[idx] in _modifiers or words[idx].startswith("@[")):
+                        idx += 1
+                    if idx < len(words) and words[idx] in _core_keywords and idx + 1 < len(words):
+                        name_part = words[idx + 1].rstrip(":({[")
+                        if name_part == decl_name:
+                            fqn = ".".join(ns_stack + [decl_name]) if ns_stack else decl_name
+                            candidates.append(fqn)
+            if len(candidates) == 1:
+                resolved_name = candidates[0]
+            elif len(candidates) > 1:
+                # Deduplicate (same FQN found twice shouldn't happen, but be safe)
+                unique = list(dict.fromkeys(candidates))
+                if len(unique) == 1:
+                    resolved_name = unique[0]
+                else:
                     raise LeanToolError(
-                        f"Ambiguous name '{decl_name}', matches: {candidates}"
+                        f"Ambiguous name '{decl_name}', matches: {unique}"
                     )
         except LeanToolError:
             raise
