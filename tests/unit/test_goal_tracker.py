@@ -271,23 +271,21 @@ class TestRenderTree:
         assert not any("MISSING" in l for l in lines)
         assert any("B" in l for l in lines)
 
-    def test_short_name_root_vs_fqn_nodes_bug1(self):
-        """BUG-1: render_tree called with short name but nodes keyed by FQN.
+    def test_render_tree_requires_fqn_root(self):
+        """render_tree must be called with the FQN (resolved name), not short name.
 
-        When name resolution changes 'foo' to 'A.B.foo', render_tree is called
-        with 'foo' but nodes are keyed by 'A.B.foo'. The root won't match any
-        node, rendering as a single leaf and losing the entire tree.
+        server.py passes resolved_name (not decl_name) to render_tree so that
+        the root key matches the FQN-keyed nodes dict.
         """
         nodes = {
             "A.B.foo": SorryNode("A.B.foo", sorry_deps=["A.B.bar"]),
             "A.B.bar": SorryNode("A.B.bar", explicit_sorry=True, sorry_deps=[]),
         }
-        # With short name — tree is broken (root doesn't match)
-        lines_short = render_tree("foo", nodes)
-        assert len(lines_short) == 1  # Just the root as a leaf
-        assert "A.B.bar" not in "\n".join(lines_short)  # Sorry dep lost
-
         # With FQN — tree works correctly
         lines_fqn = render_tree("A.B.foo", nodes)
         assert len(lines_fqn) == 2
         assert "A.B.bar" in "\n".join(lines_fqn)
+
+        # With short name — root doesn't match, tree degrades to single node
+        lines_short = render_tree("foo", nodes)
+        assert len(lines_short) == 1

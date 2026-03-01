@@ -1364,7 +1364,7 @@ def goal_tracker(
             )
 
     sorry_names = list(nodes.keys())
-    tree_lines = render_tree(decl_name, nodes) if nodes else []
+    tree_lines = render_tree(resolved_name, nodes) if nodes else []
 
     return GoalTrackerResult(
         target=decl_name,
