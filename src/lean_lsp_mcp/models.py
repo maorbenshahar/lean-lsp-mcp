@@ -306,7 +306,7 @@ class GoalTrackerResult(BaseModel):
     target: str = Field(description="Declaration that was checked")
     sorry_declarations: List[str] = Field(
         default_factory=list,
-        description="Declaration names that transitively depend on sorry",
+        description="Leaf declarations that explicitly contain sorry",
     )
     tree: str = Field(
         "",

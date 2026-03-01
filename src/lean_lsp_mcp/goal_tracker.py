@@ -2,9 +2,16 @@
 
 Mirrors the tree output of QuantumInformation/scripts/goal_tracker.py but
 runs entirely via LSP (no ExportDecls, no oleans needed).  The Lean
-``run_cmd`` block BFS-walks the environment, collecting every declaration
-whose transitive closure touches ``sorryAx``, then emits one line per
-sorry-tainted node so that Python can reconstruct the tree.
+``run_cmd`` block BFS-walks only sorry-tainted dependencies using
+``collectAxioms`` as an oracle, then emits one line per sorry node so that
+Python can reconstruct the tree.
+
+Key optimisation: instead of walking ALL transitive dependencies (which
+explodes into Mathlib with 10,000+ nodes), each dependency is first checked
+via ``Lean.collectAxioms``.  Only deps whose axiom closure includes
+``sorryAx`` are followed.  This keeps the visited set tiny — typically
+single-digit to low-dozens — regardless of how many Mathlib constants the
+declaration references.
 """
 
 from __future__ import annotations
@@ -18,7 +25,11 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 def make_sorry_snippet(decl_name: str) -> str:
-    """Return a ``run_cmd`` block that BFS-walks transitive deps for sorry.
+    """Return a ``run_cmd`` block that BFS-walks sorry-tainted deps.
+
+    Uses ``Lean.collectAxioms`` as a fast oracle to prune the BFS: only
+    dependencies whose axiom closure includes ``sorryAx`` are followed.
+    This avoids walking into Mathlib/stdlib entirely.
 
     Output format (one ``logInfo`` per sorry-tainted node)::
 
@@ -32,64 +43,59 @@ def make_sorry_snippet(decl_name: str) -> str:
     with ``{{"visited":int}}``.
     """
     return f"""
-set_option maxHeartbeats 800000
 open Lean Lean.Elab.Command in
 #eval show CommandElabM Unit from do
   let env ← getEnv
   let mkN (n : Name) (s : String) : Name := if let some k := s.toNat? then n.num k else n.str s
   let target : Name := "{decl_name}".splitOn "." |>.foldl mkN .anonymous
   if (env.find? target).isNone then throwError "not found: {decl_name}"
-  -- BFS: compute visited set and per-node direct constants
-  let mut visited : NameSet := .empty
-  let mut queue : Array Name := #[target]
-  -- Store (name, directlyContainsSorryAx, depsArray) per visited node
-  let mut nodeInfo : Array (Name × Bool × Array Name) := #[]
-  while queue.size > 0 do
-    let name := queue.back!
-    queue := queue.pop
-    if visited.contains name then continue
-    visited := visited.insert name
-    if (env.find? name).isNone then continue
-    let ci := (env.find? name).get!
-    let allConsts := ci.getUsedConstantsAsSet
-    let depsArr := allConsts.toArray
-    let explicit := allConsts.contains ``sorryAx
-    nodeInfo := nodeInfo.push (name, explicit, depsArr)
-    for dep in depsArr do
-      if !visited.contains dep then
-        queue := queue.push dep
-  -- Backward pass: compute transitive sorry status with memoisation
-  let mut hasSorryMap : NameMap Bool := .empty
-  -- Seed: any node that directly contains sorryAx is sorry
-  for (name, explicit, _) in nodeInfo do
-    if explicit then hasSorryMap := hasSorryMap.insert name true
-  -- Fixed-point iteration (cheap – nodeInfo is small)
-  let mut changed := true
-  while changed do
-    changed := false
-    for (name, _, deps) in nodeInfo do
-      if (hasSorryMap.find? name).getD false then continue
-      for dep in deps do
-        if (hasSorryMap.find? dep).getD false then
-          hasSorryMap := hasSorryMap.insert name true
-          changed := true
-          break
-  -- Emit one line per sorry-tainted node
-  for (name, explicit, deps) in nodeInfo do
-    unless (hasSorryMap.find? name).getD false do continue
-    let mut sorryChildren : Array String := #[]
-    for dep in deps do
-      if dep == ``sorryAx then continue
-      if (hasSorryMap.find? dep).getD false then
-        sorryChildren := sorryChildren.push dep.toString
-    let node := Json.mkObj [
-      ("name", Json.str name.toString),
-      ("explicit", Json.bool explicit),
-      ("sorry_deps", Json.arr (sorryChildren.map Json.str))
-    ]
-    logInfo m!"MCP_NODE:{{node.compress}}"
-  let summary := Json.mkObj [("visited", Json.num visited.size)]
-  logInfo m!"MCP_SUMMARY:{{summary.compress}}"
+  -- Quick check: does target have sorryAx at all?
+  let targetAxioms ← Lean.collectAxioms target
+  if !targetAxioms.contains ``sorryAx then
+    -- Clean declaration — emit summary only
+    let summary := Json.mkObj [("visited", Json.num 1)]
+    logInfo m!"MCP_SUMMARY:{{summary.compress}}"
+  else
+    -- BFS only through sorry-tainted deps (collectAxioms as oracle)
+    let mut visited : NameSet := .empty
+    let mut queue : Array Name := #[target]
+    let mut nodeInfo : Array (Name × Bool × Array Name) := #[]
+    let mut axCache : PersistentHashMap Name (Array Name) := .empty
+    axCache := axCache.insert target targetAxioms
+    while queue.size > 0 do
+      let name := queue.back!
+      queue := queue.pop
+      if visited.contains name then continue
+      visited := visited.insert name
+      if (env.find? name).isNone then continue
+      let ci := (env.find? name).get!
+      let allConsts := ci.getUsedConstantsAsSet
+      let explicit := allConsts.contains ``sorryAx
+      let mut sorryDeps : Array Name := #[]
+      for dep in allConsts.toArray do
+        if dep == ``sorryAx then continue
+        if (env.find? dep).isNone then continue
+        let depAxioms ← match axCache.find? dep with
+          | some ax => pure ax
+          | none => do
+            let ax ← Lean.collectAxioms dep
+            axCache := axCache.insert dep ax
+            pure ax
+        if depAxioms.contains ``sorryAx then
+          sorryDeps := sorryDeps.push dep
+          if !visited.contains dep then
+            queue := queue.push dep
+      nodeInfo := nodeInfo.push (name, explicit, sorryDeps)
+    -- Emit one line per sorry-tainted node
+    for (name, explicit, sorryDeps) in nodeInfo do
+      let node := Json.mkObj [
+        ("name", Json.str name.toString),
+        ("explicit", Json.bool explicit),
+        ("sorry_deps", Json.arr (sorryDeps.map fun d => Json.str d.toString))
+      ]
+      logInfo m!"MCP_NODE:{{node.compress}}"
+    let summary := Json.mkObj [("visited", Json.num visited.size)]
+    logInfo m!"MCP_SUMMARY:{{summary.compress}}"
 """
 
 

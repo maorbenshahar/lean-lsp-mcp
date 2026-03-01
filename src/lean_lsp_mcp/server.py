@@ -1363,7 +1363,7 @@ def goal_tracker(
                 "Failed to restore `%s` after goal_tracker: %s", rel_path, exc
             )
 
-    sorry_names = list(nodes.keys())
+    sorry_names = [n for n, node in nodes.items() if node.explicit_sorry]
     tree_lines = render_tree(resolved_name, nodes) if nodes else []
 
     return GoalTrackerResult(

@@ -64,3 +64,54 @@ end GtOuter
 section GtSection
 theorem gt_in_section : 1 + 1 = 2 := by norm_num
 end GtSection
+
+-- 15. Explicit sorry AND sorry'd dependencies (the coherent_states_separate_symn pattern)
+--     Declaration has sorry in its own body AND calls other sorry'd lemmas.
+--     Goal tracker must show both the declaration AND its sorry'd deps as sorry nodes.
+def gt_sub_sorry_a : Nat := sorry
+def gt_sub_sorry_b : Bool := sorry
+theorem gt_sorry_with_sorry_deps : gt_sub_sorry_a > 0 ∧ gt_sub_sorry_b = true := by
+  constructor
+  · sorry  -- explicit sorry in body
+  · sorry  -- explicit sorry in body
+
+-- 16. Querying a sorry leaf directly should show it has sorry (not empty)
+--     This is the bug: goal_tracker on a direct-sorry decl returns empty.
+--     gt_direct_sorry (case 2) already covers this but let's be explicit.
+theorem gt_leaf_sorry_self : False := by sorry
+
+-- 17. Private sorry dep used by a public theorem that ALSO has its own sorry
+namespace GtPrivate
+private def priv_sorry_helper : Nat := sorry
+theorem pub_with_priv_dep : priv_sorry_helper > 0 := by sorry
+end GtPrivate
+
+-- 18. Sorry in a have inside a proof (inline sorry, not a separate decl)
+theorem gt_inline_have_sorry : 1 + 1 = 2 := by
+  have h : True := sorry
+  norm_num
+
+-- 19. Mixed: some deps sorry, some clean, proof itself sorry
+def gt_clean_dep : Nat := 42
+def gt_sorry_dep : Nat := sorry
+theorem gt_mixed_deps : gt_clean_dep + gt_sorry_dep > 0 := by sorry
+
+-- 20. Deep chain (depth 3): A → B → C → sorry
+def gt_deep_sorry : Nat := sorry
+def gt_deep_mid : Nat := gt_deep_sorry + 1
+def gt_deep_top : Nat := gt_deep_mid + 1
+theorem gt_deep_chain : gt_deep_top > 0 := by sorry
+
+-- 21. Cross-namespace dependency
+namespace GtCross
+def cross_sorry : Nat := sorry
+end GtCross
+theorem gt_uses_cross_ns : GtCross.cross_sorry = GtCross.cross_sorry := by rfl
+
+-- 22. Instance with sorry (should be detectable)
+-- Note: sorry in instance is bad practice but tracker should still find it
+class GtMyClass (α : Type) where
+  val : α
+instance gt_sorry_instance : GtMyClass Nat where
+  val := sorry
+theorem gt_uses_sorry_instance : @GtMyClass.val Nat gt_sorry_instance = 0 := by sorry
