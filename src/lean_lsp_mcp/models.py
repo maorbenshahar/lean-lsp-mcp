@@ -302,15 +302,21 @@ class LongProofResults(BaseModel):
     files_scanned: int = Field(description="Number of .lean files scanned")
 
 
+class SorryLeaf(BaseModel):
+    name: str = Field(description="Fully qualified declaration name")
+    file: str = Field("", description="Absolute file path (empty if unresolved)")
+    line: int = Field(0, description="Line number, 1-indexed (0 if unknown)")
+
+
 class GoalTrackerResult(BaseModel):
     target: str = Field(description="Declaration that was checked")
-    sorry_declarations: List[str] = Field(
+    sorry_declarations: List[SorryLeaf] = Field(
         default_factory=list,
-        description="Leaf declarations that explicitly contain sorry",
+        description="Leaf declarations that explicitly contain sorry, with location info",
     )
     tree: str = Field(
         "",
-        description="ASCII dependency tree showing sorry propagation paths",
+        description="ASCII dependency tree showing sorry propagation paths (only if show_tree=true)",
     )
     total_transitive_deps: int = Field(
         description="Total number of transitive dependencies checked"

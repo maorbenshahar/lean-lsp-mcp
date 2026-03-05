@@ -47,6 +47,7 @@ from lean_lsp_mcp.models import (
     FileOutline,
     GoalState,
     GoalTrackerResult,
+    SorryLeaf,
     HoverInfo,
     LeanFinderResult,
     LeanFinderResults,
@@ -1241,6 +1242,10 @@ def goal_tracker(
         str,
         Field(description="Declaration name to check (must be defined in the file)"),
     ],
+    show_tree: Annotated[
+        bool,
+        Field(description="Include ASCII dependency tree in output"),
+    ] = False,
 ) -> GoalTrackerResult:
     """Check if a declaration transitively depends on sorry. Searches all transitive dependencies."""
     from lean_lsp_mcp.goal_tracker import (
@@ -1363,13 +1368,33 @@ def goal_tracker(
                 "Failed to restore `%s` after goal_tracker: %s", rel_path, exc
             )
 
-    sorry_names = [n for n, node in nodes.items() if node.explicit_sorry]
-    tree_lines = render_tree(resolved_name, nodes) if nodes else []
+    # Build enriched sorry leaf list with file/line info
+    project_path = ctx.request_context.lifespan_context.lean_project_path
+    sorry_leaves: list[SorryLeaf] = []
+    for name, node in nodes.items():
+        if not node.explicit_sorry:
+            continue
+        file_str = ""
+        line_1indexed = 0
+        if node.module and project_path:
+            # Module name like "Foo.Bar.Baz" → "Foo/Bar/Baz.lean"
+            rel = node.module.replace(".", "/") + ".lean"
+            candidate = project_path / rel
+            if candidate.is_file():
+                file_str = str(candidate)
+        if node.line is not None:
+            line_1indexed = node.line + 1  # Lean emits 0-indexed
+        sorry_leaves.append(SorryLeaf(name=name, file=file_str, line=line_1indexed))
+
+    tree_str = ""
+    if show_tree and nodes:
+        tree_lines = render_tree(resolved_name, nodes)
+        tree_str = "\n".join(tree_lines)
 
     return GoalTrackerResult(
         target=decl_name,
-        sorry_declarations=sorry_names,
-        tree="\n".join(tree_lines),
+        sorry_declarations=sorry_leaves,
+        tree=tree_str,
         total_transitive_deps=total_visited,
     )
 

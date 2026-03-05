@@ -27,7 +27,7 @@ async def test_goal_tracker_clean(
         )
         data = result_json(result)
         assert data["target"] == "verify_clean"
-        assert data["sorry_declarations"] == []
+        assert len(data["sorry_declarations"]) == 0
         assert data["total_transitive_deps"] > 0
 
 
@@ -48,7 +48,8 @@ async def test_goal_tracker_sorry(
         data = result_json(result)
         assert data["target"] == "verify_sorry"
         assert len(data["sorry_declarations"]) >= 1
-        assert "verify_sorry" in data["sorry_declarations"]
+        sorry_names = [s["name"] for s in data["sorry_declarations"]]
+        assert "verify_sorry" in sorry_names
         assert data["total_transitive_deps"] > 0
 
 

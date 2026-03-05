@@ -35,7 +35,11 @@ def make_sorry_snippet(decl_name: str) -> str:
 
         MCP_NODE:<json>
 
-    where *json* is ``{{"name":..., "explicit":bool, "sorry_deps":[...]}}``.
+    where *json* is ``{{"name":..., "explicit":bool, "sorry_deps":[...],
+    "module":str|null, "line":int|null}}``.  ``module`` and ``line`` are
+    emitted for nodes with ``explicit=true`` so callers can locate sorry
+    leaves without a separate search.
+
     A final summary line is emitted as::
 
         MCP_SUMMARY:<json>
@@ -88,12 +92,20 @@ open Lean Lean.Elab.Command in
       nodeInfo := nodeInfo.push (name, explicit, sorryDeps)
     -- Emit one line per sorry-tainted node
     for (name, explicit, sorryDeps) in nodeInfo do
-      let node := Json.mkObj [
+      -- For explicit sorry nodes, resolve module + line so callers can locate them
+      let mut fields : Array (String × Json) := #[
         ("name", Json.str name.toString),
         ("explicit", Json.bool explicit),
         ("sorry_deps", Json.arr (sorryDeps.map fun d => Json.str d.toString))
       ]
-      logInfo m!"MCP_NODE:{{node.compress}}"
+      if explicit then
+        match env.getModuleFor? name with
+        | some mod => fields := fields.push ("module", Json.str mod.toString)
+        | none => pure ()
+        match ← findDeclarationRanges? name with
+        | some ranges => fields := fields.push ("line", Json.num ranges.range.pos.line)
+        | none => pure ()
+      logInfo m!"MCP_NODE:{{(Json.mkObj fields.toList).compress}}"
     let summary := Json.mkObj [("visited", Json.num visited.size)]
     logInfo m!"MCP_SUMMARY:{{summary.compress}}"
 """
@@ -109,6 +121,8 @@ class SorryNode:
     name: str
     explicit_sorry: bool = False
     sorry_deps: list[str] = field(default_factory=list)
+    module: str | None = None
+    line: int | None = None
 
 
 def parse_sorry_result(diagnostics: list[dict]) -> tuple[dict[str, SorryNode], int]:
@@ -130,10 +144,13 @@ def parse_sorry_result(diagnostics: list[dict]) -> tuple[dict[str, SorryNode], i
             except json.JSONDecodeError:
                 continue
             name = obj["name"]
+            line_num = obj.get("line")
             nodes[name] = SorryNode(
                 name=name,
                 explicit_sorry=obj.get("explicit", False),
                 sorry_deps=obj.get("sorry_deps", []),
+                module=obj.get("module"),
+                line=int(line_num) if line_num is not None else None,
             )
         elif msg.startswith("MCP_SUMMARY:"):
             raw = msg[len("MCP_SUMMARY:"):]

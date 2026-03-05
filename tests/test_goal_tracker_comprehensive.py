@@ -37,6 +37,11 @@ import pytest
 from tests.helpers.mcp_client import MCPClient, result_json
 
 
+def sorry_names(data: dict) -> list[str]:
+    """Extract sorry leaf names from goal_tracker result."""
+    return [s["name"] for s in data["sorry_declarations"]]
+
+
 # Ground truth: does #print axioms report sorryAx?
 GROUND_TRUTH = {
     # (has_sorry_in_axioms, expected_sorry_decls_subset, description)
@@ -120,19 +125,19 @@ async def test_goal_tracker_matches_ground_truth(
                 {"file_path": str(gt_file), "decl_name": decl},
             )
             data = result_json(result)
-            sorry_decls = data["sorry_declarations"]
+            decl_names = sorry_names(data)
 
             if has_sorry:
-                assert len(sorry_decls) >= 1, (
+                assert len(decl_names) >= 1, (
                     f"goal_tracker {decl} ({desc}): expected sorry_declarations non-empty, got {data}"
                 )
                 for ed in expected_decls:
-                    assert ed in sorry_decls, (
+                    assert ed in decl_names, (
                         f"goal_tracker {decl} ({desc}): "
-                        f"expected '{ed}' in sorry_declarations={sorry_decls}"
+                        f"expected '{ed}' in sorry_declarations={decl_names}"
                     )
             else:
-                assert sorry_decls == [], (
+                assert decl_names == [], (
                     f"goal_tracker {decl} ({desc}): expected no sorry, got {data}"
                 )
 
@@ -156,7 +161,7 @@ async def test_goal_tracker_short_name_resolution(
         )
         data = result_json(result)
         assert data["target"] == "ns_sorry"
-        assert len(data["sorry_declarations"]) >= 1
+        assert len(sorry_names(data)) >= 1
         assert data["total_transitive_deps"] > 0
 
 
@@ -190,7 +195,7 @@ async def test_goal_tracker_section_no_namespace_effect(
         )
         data = result_json(result)
         assert data["target"] == "gt_in_section"
-        assert data["sorry_declarations"] == []
+        assert sorry_names(data) == []
         assert data["total_transitive_deps"] > 0
 
 
@@ -215,7 +220,7 @@ async def test_verify_and_tracker_agree(
             t_data = result_json(tracker_result)
 
             v_has_sorry = "sorryAx" in v_data["axioms"]
-            t_has_sorry = len(t_data["sorry_declarations"]) > 0
+            t_has_sorry = len(sorry_names(t_data)) > 0
 
             assert v_has_sorry == t_has_sorry, (
                 f"{decl}: verify says sorry={v_has_sorry} "
@@ -325,20 +330,20 @@ async def test_cross_file_tracker_base(
                 {"file_path": str(base_file), "decl_name": decl},
             )
             data = result_json(result)
-            sorry_decls = data["sorry_declarations"]
+            decl_names = sorry_names(data)
 
             if has_sorry:
-                assert len(sorry_decls) >= 1, (
+                assert len(decl_names) >= 1, (
                     f"goal_tracker BASE {decl} ({desc}): "
                     f"expected sorry_declarations non-empty, got {data}"
                 )
                 for ed in expected_decls:
-                    assert ed in sorry_decls, (
+                    assert ed in decl_names, (
                         f"goal_tracker BASE {decl} ({desc}): "
-                        f"expected '{ed}' in sorry_declarations={sorry_decls}"
+                        f"expected '{ed}' in sorry_declarations={decl_names}"
                     )
             else:
-                assert sorry_decls == [], (
+                assert decl_names == [], (
                     f"goal_tracker BASE {decl} ({desc}): "
                     f"expected no sorry, got {data}"
                 )
@@ -358,20 +363,20 @@ async def test_cross_file_tracker_import(
                 {"file_path": str(import_file), "decl_name": decl},
             )
             data = result_json(result)
-            sorry_decls = data["sorry_declarations"]
+            decl_names = sorry_names(data)
 
             if has_sorry:
-                assert len(sorry_decls) >= 1, (
+                assert len(decl_names) >= 1, (
                     f"goal_tracker IMPORT {decl} ({desc}): "
                     f"expected sorry_declarations non-empty, got {data}"
                 )
                 for ed in expected_decls:
-                    assert ed in sorry_decls, (
+                    assert ed in decl_names, (
                         f"goal_tracker IMPORT {decl} ({desc}): "
-                        f"expected '{ed}' in sorry_declarations={sorry_decls}"
+                        f"expected '{ed}' in sorry_declarations={decl_names}"
                     )
             else:
-                assert sorry_decls == [], (
+                assert decl_names == [], (
                     f"goal_tracker IMPORT {decl} ({desc}): "
                     f"expected no sorry, got {data}"
                 )
@@ -398,7 +403,7 @@ async def test_cross_file_verify_and_tracker_agree(
             t_data = result_json(tracker_result)
 
             v_has_sorry = "sorryAx" in v_data["axioms"]
-            t_has_sorry = len(t_data["sorry_declarations"]) > 0
+            t_has_sorry = len(sorry_names(t_data)) > 0
 
             assert v_has_sorry == t_has_sorry, (
                 f"CROSS-FILE {decl}: verify says sorry={v_has_sorry} "
@@ -447,18 +452,18 @@ async def test_heavy_tracker_does_not_walk_mathlib(
                 {"file_path": str(heavy_file), "decl_name": decl},
             )
             data = result_json(result)
-            sorry_decls = data["sorry_declarations"]
+            decl_names = sorry_names(data)
 
             # Check sorry correctness
             if has_sorry:
-                assert len(sorry_decls) >= 1, (
+                assert len(decl_names) >= 1, (
                     f"goal_tracker HEAVY {decl} ({desc}): "
                     f"expected sorry_declarations non-empty, got {data}"
                 )
                 for ed in expected_decls:
-                    assert ed in sorry_decls, (
+                    assert ed in decl_names, (
                         f"goal_tracker HEAVY {decl} ({desc}): "
-                        f"expected '{ed}' in sorry_declarations={sorry_decls}"
+                        f"expected '{ed}' in sorry_declarations={decl_names}"
                     )
 
             # THE BUG: BFS walks into Mathlib, causing 10,000+ deps
