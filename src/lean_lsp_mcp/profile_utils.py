@@ -1,8 +1,10 @@
 """Lean proof profiling via CLI trace output."""
 
 import asyncio
+import contextlib
 import os
 import re
+import signal
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -149,6 +151,12 @@ def _filter_categories(cumulative: dict[str, float]) -> dict[str, float]:
 
 async def _run_lean_profile(file_path: Path, project_path: Path, timeout: float) -> str:
     """Run lean --profile, return output."""
+    popen_kwargs = {}
+    if os.name == "posix":
+        # Put the profile run in its own process group so timeout cleanup can
+        # terminate the spawned `lean --profile` child as well as the `lake` wrapper.
+        popen_kwargs["start_new_session"] = True
+
     proc = await asyncio.create_subprocess_exec(
         "lake",
         "env",
@@ -161,13 +169,19 @@ async def _run_lean_profile(file_path: Path, project_path: Path, timeout: float)
         stderr=asyncio.subprocess.STDOUT,
         cwd=project_path.resolve(),
         env=os.environ.copy(),
+        **popen_kwargs,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return stdout.decode("utf-8", errors="replace")
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        if os.name == "posix":
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            await proc.wait()
         raise TimeoutError(f"Profiling timed out after {timeout}s")
 
 
