@@ -559,11 +559,12 @@ def test_diagnostic_messages_passes_severity_to_process(
     """diagnostic_messages tool forwards the severity parameter to _process_diagnostics."""
     captured: dict = {}
 
-    def fake_process(diagnostics, build_success, severity=None):
+    def fake_process(diagnostics, build_success, severity=None, timed_out=False):
         captured["severity"] = severity
+        captured["timed_out"] = timed_out
         from lean_lsp_mcp.models import DiagnosticsResult
 
-        return DiagnosticsResult(success=build_success, items=[])
+        return DiagnosticsResult(success=build_success, timed_out=timed_out, items=[])
 
     class FakeDiagResult:
         diagnostics = [
@@ -596,6 +597,7 @@ def test_diagnostic_messages_passes_severity_to_process(
     )
 
     assert captured["severity"] == DiagnosticSeverity.warning
+    assert captured["timed_out"] is False
 
 
 def test_diagnostic_messages_default_severity_is_none(
@@ -603,11 +605,12 @@ def test_diagnostic_messages_default_severity_is_none(
 ) -> None:
     captured: dict = {}
 
-    def fake_process(diagnostics, build_success, severity=None):
+    def fake_process(diagnostics, build_success, severity=None, timed_out=False):
         captured["severity"] = severity
+        captured["timed_out"] = timed_out
         from lean_lsp_mcp.models import DiagnosticsResult
 
-        return DiagnosticsResult(success=build_success, items=[])
+        return DiagnosticsResult(success=build_success, timed_out=timed_out, items=[])
 
     class FakeDiagResult:
         diagnostics = []
@@ -629,6 +632,7 @@ def test_diagnostic_messages_default_severity_is_none(
     server.diagnostic_messages(ctx=ctx, file_path="/abs/Foo.lean")
 
     assert captured["severity"] is None
+    assert captured["timed_out"] is False
 
 
 class _FakeDiagnostics(list):

@@ -199,13 +199,12 @@ async def _run_lean_profile(file_path: Path, project_path: Path, timeout: float)
         cleaned_up = True
         raise TimeoutError(f"Profiling timed out after {timeout}s")
     finally:
-        if cleaned_up:
-            return
-        if os.name == "posix":
-            _kill_process_group(proc.pid)
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+        if not cleaned_up:
+            if os.name == "posix":
+                _kill_process_group(proc.pid)
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
 
 
 def _find_proof_start(source_lines: list[str]) -> int:
