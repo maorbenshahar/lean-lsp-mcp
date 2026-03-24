@@ -5,6 +5,7 @@ Run with:
     .venv/bin/python tests/test_snippet_correctness.py
 """
 
+import json
 import re
 import time
 from pathlib import Path

@@ -149,14 +149,27 @@ def _filter_categories(cumulative: dict[str, float]) -> dict[str, float]:
     }
 
 
+def _kill_process_group(pid: int) -> None:
+    """Kill an entire process group. No-op if already dead."""
+    if not hasattr(os, "killpg"):
+        return
+    try:
+        os.killpg(os.getpgid(pid), 9)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 async def _run_lean_profile(file_path: Path, project_path: Path, timeout: float) -> str:
-    """Run lean --profile, return output."""
+    """Run lean --profile, return output.
+
+    Uses start_new_session so lake/elan/lean share a process group that we
+    can kill as a unit.  Without this, lean survives as an orphan (~2.5 GB).
+    """
     popen_kwargs = {}
     if os.name == "posix":
         # Put the profile run in its own process group so timeout cleanup can
         # terminate the spawned `lean --profile` child as well as the `lake` wrapper.
         popen_kwargs["start_new_session"] = True
-
     proc = await asyncio.create_subprocess_exec(
         "lake",
         "env",
@@ -171,6 +184,7 @@ async def _run_lean_profile(file_path: Path, project_path: Path, timeout: float)
         env=os.environ.copy(),
         **popen_kwargs,
     )
+    cleaned_up = False
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return stdout.decode("utf-8", errors="replace")
@@ -182,7 +196,15 @@ async def _run_lean_profile(file_path: Path, project_path: Path, timeout: float)
             proc.kill()
         with contextlib.suppress(ProcessLookupError):
             await proc.wait()
+        cleaned_up = True
         raise TimeoutError(f"Profiling timed out after {timeout}s")
+    finally:
+        if not cleaned_up:
+            if os.name == "posix":
+                _kill_process_group(proc.pid)
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
 
 
 def _find_proof_start(source_lines: list[str]) -> int:
