@@ -27,12 +27,18 @@ from mcp.types import ErrorData, METHOD_NOT_FOUND, ToolAnnotations
 from pydantic import Field
 
 from lean_lsp_mcp.client_utils import (
+    CLIENT_LOCK,
     LeanLSPClient,
+    _active_transport,
+    _max_opened_files,
+    _project_switching_allowed,
+    bind_lean_project_path,
     close_shared_client,
+    get_path_policy,
     infer_project_path,
     replace_shared_client,
     resolve_file_path,
-    replace_shared_client,
+    set_build_in_progress,
     setup_client_for_file,
     startup_client,
 )
@@ -69,8 +75,6 @@ from lean_lsp_mcp.models import (
     LeanSearchResults,
     LocalSearchResult,
     LocalSearchResults,
-    LongProofEntry,
-    LongProofResults,
     LoogleResult,
     LoogleResults,
     MultiAttemptResult,
@@ -116,6 +120,9 @@ _TOOL_DESCRIPTIONS_ENV = "LEAN_MCP_TOOL_DESCRIPTIONS"
 POSITION_QUERY_INACTIVITY_TIMEOUT = float(
     os.environ.get("LEAN_LSP_POSITION_QUERY_INACTIVITY_TIMEOUT", "3.0")
 )
+MULTI_ATTEMPT_LSP_MAX_TIMEOUT = float(
+    os.environ.get("LEAN_LSP_MULTI_ATTEMPT_MAX_TIMEOUT", "300.0")
+)
 
 
 def _raise_invalid_path(file_path: str) -> None:
@@ -124,6 +131,17 @@ def _raise_invalid_path(file_path: str) -> None:
         f"Invalid Lean file path: '{file_path}' not found in any Lean project "
         "(no lean-toolchain ancestor or file does not exist)"
     )
+
+
+def _validate_theorem_name(theorem_name: str) -> str:
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*",
+        theorem_name,
+    ):
+        raise LeanToolError(
+            "Invalid theorem name. Use a Lean fully qualified name such as `Namespace.theorem`."
+        )
+    return theorem_name
 
 
 def _call_lsp_request(
@@ -138,6 +156,12 @@ def _call_lsp_request(
     except (FutureTimeoutError, TimeoutError, asyncio.TimeoutError):
         logger.warning("%s timed out waiting for an LSP response", operation)
         return None, True
+
+    if isinstance(response, dict) and "error" in response:
+        msg = str(response["error"].get("message", ""))
+        if "timed out" in msg.lower():
+            logger.warning("%s timed out waiting for an LSP response", operation)
+            return None, True
 
     check_lsp_response(response, operation, allow_none=allow_none)
     return response, False
@@ -1463,7 +1487,9 @@ def declaration_file(
     )
 
     return DeclarationInfo(
-        file_path=str(abs_path), content=file_content, timed_out=timed_out
+        file_path=policy.display_path(abs_path),
+        content=file_content,
+        timed_out=timed_out,
     )
 
 
@@ -1635,6 +1661,7 @@ def _multi_attempt_lsp(
     lines = original_content.splitlines() if original_content is not None else []
     line_context = _get_line_context(lines, line)
     target_column = _resolve_multi_attempt_column(line_context, column)
+    deadline = time.monotonic() + MULTI_ATTEMPT_LSP_MAX_TIMEOUT
 
     try:
         results: List[AttemptResult] = []
@@ -1642,23 +1669,62 @@ def _multi_attempt_lsp(
             snippet_str, change, goal_line, goal_column = _prepare_multi_attempt_edit(
                 line_context, target_column, snippet, len(lines), line
             )
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0.0:
+                results.append(AttemptResult(snippet=snippet_str, timed_out=True))
+                break
             client.update_file(rel_path, [change])
-            diag = client.get_diagnostics(rel_path)
+            diag = client.get_diagnostics(rel_path, max_timeout=remaining)
             check_lsp_response(diag, "get_diagnostics")
             filtered_diag = _filter_diagnostics_by_line_range(diag, line - 1, goal_line)
-            goal_result = client.get_goal(rel_path, goal_line, goal_column)
-            check_lsp_response(goal_result, "get_goal", allow_none=True)
+            diagnostics = _to_diagnostic_messages(filtered_diag)
+            if getattr(diag, "timed_out", False):
+                results.append(
+                    AttemptResult(
+                        snippet=snippet_str,
+                        diagnostics=diagnostics,
+                        timed_out=True,
+                    )
+                )
+                break
+
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0.0:
+                results.append(
+                    AttemptResult(
+                        snippet=snippet_str,
+                        diagnostics=diagnostics,
+                        timed_out=True,
+                    )
+                )
+                break
+
+            goal_result, goal_timed_out = _call_lsp_request(
+                "get_goal",
+                lambda: client.get_goal(
+                    rel_path, goal_line, goal_column, timeout=remaining
+                ),
+                allow_none=True,
+            )
             goals = extract_goals_list(goal_result)
             results.append(
                 AttemptResult(
                     snippet=snippet_str,
                     goals=goals,
-                    diagnostics=_to_diagnostic_messages(filtered_diag),
-                    timed_out=getattr(diag, "timed_out", False),
+                    diagnostics=diagnostics,
+                    timed_out=goal_timed_out,
                 )
             )
+            if goal_timed_out:
+                break
 
-        return MultiAttemptResult(items=results)
+        result = MultiAttemptResult(items=results)
+        _log_tool_result(
+            "lean_multi_attempt",
+            timed_out=any(item.timed_out for item in result.items),
+            detail=f"{rel_path}:{line}:{column or 'line'}",
+        )
+        return result
     finally:
         if original_content is not None:
             try:
@@ -2161,45 +2227,6 @@ async def local_search(
         return LocalSearchResults(items=results)
     except RuntimeError as exc:
         raise LocalSearchError(f"Search failed: {exc}")
-
-
-@mcp.tool(
-    "lean_long_proofs",
-    annotations=ToolAnnotations(
-        title="Long Proofs",
-        readOnlyHint=True,
-        idempotentHint=True,
-        openWorldHint=False,
-    ),
-)
-async def long_proofs(
-    ctx: Context,
-    file_path: Annotated[
-        str, Field(description="Absolute path to a .lean file or directory to scan")
-    ],
-    warn_threshold: Annotated[
-        int, Field(description="Minimum proof lines to report", ge=1)
-    ] = 30,
-) -> LongProofResults:
-    """Find long tactic proofs. Scans for `theorem`/`lemma`/`def`/`instance` declarations with `:= by` blocks exceeding the line threshold."""
-    if not _RG_AVAILABLE:
-        raise LeanToolError(_RG_MESSAGE)
-
-    from lean_lsp_mcp.long_proof_utils import find_long_proofs
-
-    scan_path = Path(file_path).expanduser().resolve()
-    if not scan_path.exists():
-        raise LeanToolError(f"Path does not exist: {file_path}")
-
-    entries, files_scanned = await asyncio.to_thread(
-        find_long_proofs,
-        scan_path,
-        warn_threshold,
-    )
-
-    items = [LongProofEntry(**e) for e in entries]
-    return LongProofResults(items=items, files_scanned=files_scanned)
-
 
 @mcp.tool(
     "lean_leansearch",

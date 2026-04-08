@@ -143,12 +143,10 @@ async def test_app_lifespan_does_not_close_shared_client(
     assert dummy_client.closed_calls == 0
 
 
-@pytest.mark.asyncio
-async def test_app_lifespan_does_not_attempt_client_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("LEAN_LOG_LEVEL", raising=False)
-    monkeypatch.delenv("LEAN_PROJECT_PATH", raising=False)
+def test_close_shared_client_closes_client() -> None:
+    """close_shared_client() closes the shared singleton and resets state."""
+    dummy = DummyClient()
+    client_utils._shared_clients[Path("/tmp/proj")] = dummy
 
     try:
         client_utils.close_shared_client()
@@ -158,7 +156,32 @@ async def test_app_lifespan_does_not_attempt_client_close(
         client_utils._shared_clients.clear()
 
 
-    assert dummy_client.close_calls == 0
+def test_close_shared_client_suppresses_error() -> None:
+    """close_shared_client() suppresses exceptions from client.close()."""
+
+    class _FailingCloseClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise PermissionError("operation not permitted")
+
+    dummy = _FailingCloseClient()
+    client_utils._shared_clients[Path("/tmp/proj")] = dummy
+
+    try:
+        client_utils.close_shared_client()  # should not raise
+        assert dummy.close_calls == 1
+        assert client_utils._shared_clients == {}
+    finally:
+        client_utils._shared_clients.clear()
+
+
+def test_close_shared_client_noop_when_none() -> None:
+    """close_shared_client() is safe to call when no client exists."""
+    client_utils._shared_clients.clear()
+    client_utils.close_shared_client()
 
 
 @pytest.mark.asyncio
@@ -483,10 +506,12 @@ class _BaseMultiAttemptClient:
     def update_file(self, _path: str, _changes: list[object]) -> None:
         return
 
-    def get_diagnostics(self, _path: str) -> list[dict]:
+    def get_diagnostics(self, _path: str, **_kwargs) -> list[dict]:
         return []
 
-    def get_goal(self, _path: str, _line: int, _column: int) -> dict:
+    def get_goal(
+        self, _path: str, _line: int, _column: int, **_kwargs
+    ) -> dict | None:
         return {}
 
     def update_file_content(self, path: str, content: str) -> None:
@@ -552,6 +577,9 @@ def test_declaration_file_sanitizes_dependency_path(
 
         def get_file_content(self, _path: str) -> str:
             return "dep"
+
+        def get_diagnostics(self, _path: str, **_kwargs) -> list[dict]:
+            return []
 
         def get_declarations(self, _path: str, _line: int, _column: int) -> list[dict]:
             return [{"uri": "dep-uri"}]
@@ -654,6 +682,89 @@ async def test_profile_proof_rejects_paths_outside_policy(tmp_path: Path) -> Non
 
     with pytest.raises(server.LeanToolError, match="outside the active Lean project"):
         await server.profile_proof(ctx=ctx, file_path=str(outside_file), line=1)
+
+
+def test_multi_attempt_stops_batch_on_diagnostics_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDiagnostics(list):
+        def __init__(self, *, timed_out: bool):
+            super().__init__([])
+            self.timed_out = timed_out
+
+    class FakeClient(_BaseMultiAttemptClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.goal_calls = 0
+            self.diagnostic_timeouts: list[float] = []
+
+        def get_file_content(self, _path: str) -> str:
+            return "theorem t : True := by\n  trivial\n"
+
+        def get_diagnostics(self, _path: str, **kwargs) -> FakeDiagnostics:
+            self.diagnostic_timeouts.append(kwargs["max_timeout"])
+            return FakeDiagnostics(timed_out=True)
+
+        def get_goal(
+            self, _path: str, _line: int, _column: int, **_kwargs
+        ) -> dict | None:
+            self.goal_calls += 1
+            return {"goals": ["⊢ True"]}
+
+    fake_client = FakeClient()
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = fake_client
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+    monkeypatch.setattr(server, "get_file_contents", lambda _path: "disk-content")
+
+    result = server._multi_attempt_lsp(
+        ctx, "/abs/Foo.lean", line=1, snippets=["exact True.intro", "trivial"]
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].snippet == "exact True.intro"
+    assert result.items[0].timed_out is True
+    assert fake_client.goal_calls == 0
+    assert len(fake_client.diagnostic_timeouts) == 1
+    assert fake_client.restore_calls == [("Foo.lean", "theorem t : True := by\n  trivial\n")]
+    assert fake_client.open_calls == [("Foo.lean", False), ("Foo.lean", True)]
+
+
+def test_multi_attempt_stops_batch_on_goal_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeClient(_BaseMultiAttemptClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.goal_timeouts: list[float] = []
+
+        def get_file_content(self, _path: str) -> str:
+            return "theorem t : True := by\n  trivial\n"
+
+        def get_goal(
+            self, _path: str, _line: int, _column: int, **kwargs
+        ) -> dict | None:
+            self.goal_timeouts.append(kwargs["timeout"])
+            return {"error": {"message": "Request timed out after 1.0s"}}
+
+    fake_client = FakeClient()
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = fake_client
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+    monkeypatch.setattr(server, "get_file_contents", lambda _path: "disk-content")
+
+    result = server._multi_attempt_lsp(
+        ctx, "/abs/Foo.lean", line=1, snippets=["exact True.intro", "trivial"]
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].snippet == "exact True.intro"
+    assert result.items[0].timed_out is True
+    assert len(fake_client.goal_timeouts) == 1
+    assert fake_client.restore_calls == [("Foo.lean", "theorem t : True := by\n  trivial\n")]
+    assert fake_client.open_calls == [("Foo.lean", False), ("Foo.lean", True)]
 
 
 # ---------------------------------------------------------------------------
