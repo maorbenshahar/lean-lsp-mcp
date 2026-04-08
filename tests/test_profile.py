@@ -4,11 +4,14 @@ These tests run actual Lean profiling and verify the output structure.
 If Lean's profiler format changes, these tests should fail.
 """
 
+import asyncio
+import os
+import signal
 from pathlib import Path
 
 import pytest
 
-from lean_lsp_mcp.profile_utils import profile_theorem
+from lean_lsp_mcp.profile_utils import _run_lean_profile, profile_theorem
 from tests.helpers.mcp_client import MCPToolError, result_json
 
 
@@ -101,3 +104,52 @@ class TestProfileProofTool:
                         "line": 999,
                     },
                 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
+async def test_profile_timeout_kills_process_group(monkeypatch, tmp_path: Path):
+    class FakeProc:
+        def __init__(self):
+            self.pid = 424242
+            self.kill_called = False
+            self.wait_called = False
+
+        async def communicate(self):
+            return b"", b""
+
+        def kill(self):
+            self.kill_called = True
+
+        async def wait(self):
+            self.wait_called = True
+            return 0
+
+    proc = FakeProc()
+    seen_kwargs = {}
+    killpg_calls = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return proc
+
+    async def fake_wait_for(awaitable, timeout):
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        raise asyncio.TimeoutError
+
+    def fake_killpg(pid, sig):
+        killpg_calls.append((pid, sig))
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(os, "killpg", fake_killpg)
+
+    with pytest.raises(TimeoutError, match="Profiling timed out"):
+        await _run_lean_profile(tmp_path / "Tmp.lean", tmp_path, timeout=0.01)
+
+    assert seen_kwargs["start_new_session"] is True
+    assert killpg_calls == [(proc.pid, signal.SIGKILL)]
+    assert proc.wait_called is True
+    assert proc.kill_called is False

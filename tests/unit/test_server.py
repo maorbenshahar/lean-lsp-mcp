@@ -5,6 +5,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 import importlib
 import json
 import types
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,6 +14,7 @@ import pytest
 from lean_lsp_mcp import client_utils
 from lean_lsp_mcp import server
 from lean_lsp_mcp.models import DiagnosticSeverity
+from lean_lsp_mcp.utils import LeanToolError
 
 
 class DummyClient:
@@ -114,9 +116,10 @@ async def test_app_lifespan_sets_project_path(
 
 
 @pytest.mark.asyncio
-async def test_app_lifespan_requires_project_path_for_remote_transport(
+async def test_app_lifespan_keeps_shared_client_alive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("LEAN_LOG_LEVEL", raising=False)
     monkeypatch.delenv("LEAN_PROJECT_PATH", raising=False)
     monkeypatch.setenv("LEAN_LSP_MCP_ACTIVE_TRANSPORT", "streamable-http")
 
@@ -140,10 +143,12 @@ async def test_app_lifespan_does_not_close_shared_client(
     assert dummy_client.closed_calls == 0
 
 
-def test_close_shared_client_closes_client() -> None:
-    """close_shared_client() closes the shared singleton and resets state."""
-    dummy = DummyClient()
-    client_utils._shared_clients[Path("/tmp/proj")] = dummy
+@pytest.mark.asyncio
+async def test_app_lifespan_does_not_attempt_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LEAN_LOG_LEVEL", raising=False)
+    monkeypatch.delenv("LEAN_PROJECT_PATH", raising=False)
 
     try:
         client_utils.close_shared_client()
@@ -153,32 +158,7 @@ def test_close_shared_client_closes_client() -> None:
         client_utils._shared_clients.clear()
 
 
-def test_close_shared_client_suppresses_error() -> None:
-    """close_shared_client() suppresses exceptions from client.close()."""
-
-    class _FailingCloseClient:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def close(self) -> None:
-            self.close_calls += 1
-            raise PermissionError("operation not permitted")
-
-    dummy = _FailingCloseClient()
-    client_utils._shared_clients[Path("/tmp/proj")] = dummy
-
-    try:
-        client_utils.close_shared_client()  # should not raise
-        assert dummy.close_calls == 1
-        assert client_utils._shared_clients == {}
-    finally:
-        client_utils._shared_clients.clear()
-
-
-def test_close_shared_client_noop_when_none() -> None:
-    """close_shared_client() is safe to call when no client exists."""
-    client_utils._shared_clients.clear()
-    client_utils.close_shared_client()  # should not raise
+    assert dummy_client.close_calls == 0
 
 
 @pytest.mark.asyncio
@@ -791,9 +771,10 @@ def test_diagnostic_messages_passes_severity_to_process(
 
     def fake_process(diagnostics, build_success, severity=None, timed_out=False):
         captured["severity"] = severity
+        captured["timed_out"] = timed_out
         from lean_lsp_mcp.models import DiagnosticsResult
 
-        return DiagnosticsResult(success=build_success, items=[])
+        return DiagnosticsResult(success=build_success, timed_out=timed_out, items=[])
 
     class FakeDiagResult:
         diagnostics = [
@@ -827,6 +808,7 @@ def test_diagnostic_messages_passes_severity_to_process(
     )
 
     assert captured["severity"] == DiagnosticSeverity.warning
+    assert captured["timed_out"] is False
 
 
 def test_diagnostic_messages_default_severity_is_none(
@@ -836,9 +818,10 @@ def test_diagnostic_messages_default_severity_is_none(
 
     def fake_process(diagnostics, build_success, severity=None, timed_out=False):
         captured["severity"] = severity
+        captured["timed_out"] = timed_out
         from lean_lsp_mcp.models import DiagnosticsResult
 
-        return DiagnosticsResult(success=build_success, items=[])
+        return DiagnosticsResult(success=build_success, timed_out=timed_out, items=[])
 
     class FakeDiagResult:
         diagnostics = []
@@ -861,108 +844,190 @@ def test_diagnostic_messages_default_severity_is_none(
     server.diagnostic_messages(ctx=ctx, file_path="/abs/Foo.lean")
 
     assert captured["severity"] is None
+    assert captured["timed_out"] is False
 
 
-def test_goal_retries_after_cold_file_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeClient:
-        def __init__(self) -> None:
-            self.goal_calls = 0
-            self.diagnostic_calls: list[tuple[str, float]] = []
-            self.open_calls: list[tuple[str, bool]] = []
-
-        def open_file(self, path: str, force_reopen: bool = False, **_kw) -> None:
-            self.open_calls.append((path, force_reopen))
-            return
-
-        def get_file_content(self, _path: str) -> str:
-            return "import Mathlib\n\ntheorem sample_goal : True := by\n  trivial\n"
-
-        def get_goal(self, _path: str, _line: int, _column: int) -> dict:
-            self.goal_calls += 1
-            if self.goal_calls == 1:
-                raise FuturesTimeoutError()
-            return {"goals": ["⊢ True"]}
-
-        def get_diagnostics(
-            self,
-            path: str,
-            *,
-            inactivity_timeout: float,
-        ):
-            self.diagnostic_calls.append((path, inactivity_timeout))
-            return types.SimpleNamespace(diagnostics=[], success=True)
-
-    monkeypatch.setattr(
-        server, "setup_client_for_file", lambda _ctx, _path: "GoalSample.lean"
-    )
-
-    ctx = _make_ctx()
-    fake_client = FakeClient()
-    ctx.request_context.lifespan_context.client = fake_client
-
-    result = server.goal(ctx, file_path="/abs/GoalSample.lean", line=4, column=3)
-
-    assert result.goals == ["⊢ True"]
-    assert fake_client.goal_calls == 2
-    assert fake_client.open_calls == [("GoalSample.lean", False)]
-    assert fake_client.diagnostic_calls == [("GoalSample.lean", 30.0)]
+class _FakeDiagnostics(list):
+    def __init__(self, items: list[dict] | None = None, *, timed_out: bool = False):
+        super().__init__(items or [])
+        self.timed_out = timed_out
 
 
-def test_goal_returns_no_goals_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeClient:
-        def __init__(self) -> None:
-            self.goal_calls = 0
-            self.diagnostic_calls = 0
-            self.open_calls: list[tuple[str, bool]] = []
+class _PositionClient:
+    def __init__(
+        self,
+        *,
+        diagnostics_timed_out: bool = False,
+        goal_result: dict | None = None,
+        term_goal_result: dict | None = None,
+        hover_result: dict | None = None,
+        completions_result: list[dict] | None = None,
+        declarations_result: list[dict] | Exception | None = None,
+    ) -> None:
+        self.diagnostics_timed_out = diagnostics_timed_out
+        self.goal_result = goal_result
+        self.term_goal_result = term_goal_result
+        self.hover_result = hover_result
+        self.completions_result = completions_result or []
+        self.declarations_result = declarations_result or []
 
-        def open_file(self, path: str, force_reopen: bool = False, **_kw) -> None:
-            self.open_calls.append((path, force_reopen))
+    def open_file(self, _path: str) -> None:
+        return
 
-        def get_file_content(self, _path: str) -> str:
-            return "import Mathlib\n\ntheorem sample_goal : True := by\n  trivial\n"
+    def get_file_content(self, _path: str) -> str:
+        return "\n".join(
+            [
+                "import Mathlib",
+                "",
+                "theorem sampleTheorem : True := by",
+                "  trivial",
+                "",
+                "def completionTest : Nat := Nat.su",
+                "def sampleValue : Nat := 42",
+            ]
+        )
 
-        def get_goal(self, _path: str, _line: int, _column: int) -> None:
-            self.goal_calls += 1
-            return None
+    def get_diagnostics(
+        self,
+        _path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        inactivity_timeout: float = 15.0,
+    ) -> _FakeDiagnostics:
+        _ = (start_line, end_line, inactivity_timeout)
+        return _FakeDiagnostics([], timed_out=self.diagnostics_timed_out)
 
-        def get_diagnostics(self, *_a, **_kw):
-            self.diagnostic_calls += 1
-            return types.SimpleNamespace(diagnostics=[], success=True)
+    def get_goal(self, _path: str, _line: int, _column: int) -> dict | None:
+        return self.goal_result
 
-    monkeypatch.setattr(
-        server, "setup_client_for_file", lambda _ctx, _path: "GoalSample.lean"
-    )
+    def get_term_goal(self, _path: str, _line: int, _column: int) -> dict | None:
+        return self.term_goal_result
 
-    ctx = _make_ctx()
-    fake_client = FakeClient()
-    ctx.request_context.lifespan_context.client = fake_client
+    def get_hover(self, _path: str, _line: int, _column: int) -> dict | None:
+        return self.hover_result
 
-    result = server.goal(ctx, file_path="/abs/GoalSample.lean", line=4, column=3)
+    def get_completions(self, _path: str, _line: int, _column: int) -> list[dict]:
+        return self.completions_result
 
-    assert result.goals == []
-    assert fake_client.goal_calls == 1
-    assert fake_client.open_calls == [("GoalSample.lean", False)]
-    assert fake_client.diagnostic_calls == 0
+    def get_declarations(self, _path: str, _line: int, _column: int) -> list[dict]:
+        if isinstance(self.declarations_result, Exception):
+            raise self.declarations_result
+        return self.declarations_result
+
+    def _uri_to_abs(self, uri: str) -> str:
+        return uri
 
 
-@pytest.mark.asyncio
-async def test_multi_attempt_repl_does_not_autodiscover_binary(
+def test_goal_marks_timeout_when_preparation_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_resolve(*_args, **_kwargs):
-        raise AssertionError("unexpected")
-
     ctx = _make_ctx()
-    lifespan = ctx.request_context.lifespan_context
-    lifespan.repl_enabled = True
-    lifespan.repl = None
-    monkeypatch.setattr(server, "resolve_file_path", fail_resolve)
-
-    result = await server._multi_attempt_repl(
-        ctx,
-        file_path="/abs/Foo.lean",
-        line=1,
-        snippets=["trivial"],
+    ctx.request_context.lifespan_context.client = _PositionClient(
+        diagnostics_timed_out=True
     )
 
-    assert result is None
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+
+    result = server.goal(ctx=ctx, file_path="/abs/Foo.lean", line=4, column=3)
+
+    assert result.timed_out is True
+    assert result.goals == []
+
+
+def test_hover_returns_timeout_payload_instead_of_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = _PositionClient(
+        diagnostics_timed_out=True
+    )
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+
+    result = server.hover(ctx=ctx, file_path="/abs/Foo.lean", line=7, column=5)
+
+    assert result.timed_out is True
+    assert result.symbol == ""
+    assert result.info == ""
+
+
+def test_hover_still_raises_when_not_timed_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = _PositionClient()
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+
+    with pytest.raises(LeanToolError, match="No hover information"):
+        server.hover(ctx=ctx, file_path="/abs/Foo.lean", line=7, column=5)
+
+
+def test_term_goal_marks_timeout_when_request_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _TimeoutTermGoalClient(_PositionClient):
+        def get_term_goal(self, _path: str, _line: int, _column: int) -> dict | None:
+            raise FutureTimeoutError()
+
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = _TimeoutTermGoalClient()
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+
+    result = server.term_goal(ctx=ctx, file_path="/abs/Foo.lean", line=4, column=3)
+
+    assert result.timed_out is True
+    assert result.expected_type is None
+
+
+def test_completions_propagate_timeout_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = _PositionClient(
+        diagnostics_timed_out=True,
+        completions_result=[{"label": "succ", "kind": 3}],
+    )
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+
+    result = server.completions(
+        ctx=ctx,
+        file_path="/abs/Foo.lean",
+        line=6,
+        column=31,
+        max_completions=10,
+    )
+
+    assert result.timed_out is True
+    assert [item.label for item in result.items] == ["succ"]
+
+
+def test_declaration_file_returns_timeout_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    src = tmp_path / "Foo.lean"
+    src.write_text("def sampleValue : Nat := 42\n", encoding="utf-8")
+
+    class _TimeoutDeclarationsClient(_PositionClient):
+        def get_file_content(self, _path: str) -> str:
+            return src.read_text(encoding="utf-8")
+
+        def get_declarations(self, _path: str, _line: int, _column: int) -> list[dict]:
+            raise FutureTimeoutError()
+
+    ctx = _make_ctx()
+    ctx.request_context.lifespan_context.client = _TimeoutDeclarationsClient()
+
+    monkeypatch.setattr(server, "setup_client_for_file", lambda _ctx, _path: "Foo.lean")
+
+    result = server.declaration_file(
+        ctx=ctx,
+        file_path=str(src),
+        symbol="sampleValue",
+    )
+
+    assert result.timed_out is True
+    assert result.file_path == ""
+    assert result.content == ""

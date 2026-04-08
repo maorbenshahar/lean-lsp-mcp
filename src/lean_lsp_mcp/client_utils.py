@@ -1,10 +1,16 @@
+from __future__ import annotations
+
+import asyncio
 import os
+import time
 from pathlib import Path
 from threading import Lock
 
 from leanclient import LeanLSPClient
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.utilities.logging import get_logger
+from leanclient import LeanLSPClient as BaseLeanLSPClient
+from leanclient.file_manager import DiagnosticsResult as BaseDiagnosticsResult
 
 from lean_lsp_mcp.file_utils import (
     LeanPathPolicy,
@@ -18,206 +24,360 @@ from lean_lsp_mcp.utils import OutputCapture
 
 logger = get_logger(__name__)
 CLIENT_LOCK = Lock()
-_ACTIVE_TRANSPORT_ENV = "LEAN_LSP_MCP_ACTIVE_TRANSPORT"
-_shared_clients: dict[Path, LeanLSPClient] = {}
-_builds_in_progress: set[Path] = set()
+SHARED_CLIENT: "LeanLSPClient" | None = None
+SHARED_CLIENT_PROJECT_PATH: Path | None = None
 
 
-_MAX_SHARED_CLIENTS = 8
+class LeanLSPClient(BaseLeanLSPClient):
+    """Lean client wrapper with safe cleanup for background diagnostics waits."""
 
+    @staticmethod
+    def _with_timed_out_flag(
+        result: BaseDiagnosticsResult, timed_out: bool
+    ) -> BaseDiagnosticsResult:
+        result.timed_out = timed_out
+        return result
 
-def _active_transport(ctx: Context | None = None) -> str:
-    if ctx is not None:
-        lifespan = ctx.request_context.lifespan_context
-        transport = getattr(lifespan, "active_transport", None)
-        if isinstance(transport, str) and transport:
-            return transport
-    return os.environ.get(_ACTIVE_TRANSPORT_ENV, "stdio").strip().lower() or "stdio"
+    @staticmethod
+    def _is_benign_detached_future_error(exc: Exception) -> bool:
+        msg = str(exc)
+        return "The file worker for" in msg and "has been terminated." in msg
 
+    def _detach_async_future(self, future: asyncio.Future) -> None:
+        for request_id, candidate in list(self._futures.items()):
+            if candidate is future:
+                self._futures.pop(request_id, None)
+                break
 
-def _project_switching_allowed(ctx: Context | None = None) -> bool:
-    if ctx is not None:
-        lifespan = ctx.request_context.lifespan_context
-        explicit = getattr(lifespan, "project_switching_allowed", None)
-        if explicit is not None:
-            return bool(explicit)
-    return _active_transport(ctx) == "stdio"
+        if not future.done():
+            if self._loop and not self._loop.is_closed():
+                self._loop.call_soon_threadsafe(future.cancel)
+            return
 
-
-def _max_opened_files() -> int:
-    raw_value = os.environ.get("LEAN_LSP_MAX_OPEN_FILES", "4")
-    try:
-        value = int(raw_value)
-    except ValueError:
-        logger.warning(
-            "Invalid LEAN_LSP_MAX_OPEN_FILES=%s, defaulting to 4.", raw_value
-        )
-        return 4
-    if value < 1:
-        logger.warning(
-            "Invalid LEAN_LSP_MAX_OPEN_FILES=%s, defaulting to 4.", raw_value
-        )
-        return 4
-    return value
-
-
-def _client_is_alive(client: LeanLSPClient) -> bool:
-    process = getattr(client, "process", None)
-    if process is None:
-        return True
-
-    poll = getattr(process, "poll", None)
-    if callable(poll):
         try:
-            return poll() is None
-        except Exception:
+            future.result()
+        except asyncio.CancelledError:
+            return
+        except EOFError as exc:
+            logger.debug("Ignoring detached diagnostics wait after LSP shutdown: %s", exc)
+        except Exception as exc:
+            if self._is_benign_detached_future_error(exc):
+                logger.debug(
+                    "Ignoring detached diagnostics wait after worker shutdown: %s", exc
+                )
+            else:
+                logger.warning("Detached diagnostics wait failed: %s", exc)
+
+    def _wait_for_diagnostics(
+        self,
+        uris: list[str],
+        inactivity_timeout: float = 15.0,
+        max_timeout: float = 300.0,
+    ) -> bool:
+        """Wait until diagnostics are ready without leaking late waitForDiagnostics futures."""
+        paths = [self._uri_to_local(uri) for uri in uris]
+        path_by_uri = dict(zip(uris, paths))
+
+        with self._opened_files_lock:
+            missing = [p for p in paths if p not in self.opened_files]
+            if missing:
+                raise FileNotFoundError(
+                    f"Files {missing} are not open. Call open_files first."
+                )
+
+        uris_needing_wait = []
+        target_versions: dict[str, int] = {}
+        with self._opened_files_lock:
+            for uri in uris:
+                path = path_by_uri[uri]
+                state = self.opened_files[path]
+
+                if not state.complete and not state.processing:
+                    if state.diagnostics_version >= state.version:
+                        state.complete = True
+
+                if not state.complete:
+                    uris_needing_wait.append(uri)
+                    target_versions[uri] = state.version
+
+        if not uris_needing_wait:
+            return True
+
+        futures_by_uri: dict[str, asyncio.Future] = {}
+        for uri in uris_needing_wait:
+            params = {"uri": uri, "version": target_versions[uri]}
+            futures_by_uri[uri] = self._send_request_async(
+                "textDocument/waitForDiagnostics", params
+            )
+
+        def cleanup_wait_futures() -> None:
+            for future in futures_by_uri.values():
+                self._detach_async_future(future)
+
+        start_time = time.monotonic()
+        pending_uris = set(uris_needing_wait)
+
+        try:
+            while pending_uris:
+                current_time = time.monotonic()
+                total_elapsed = current_time - start_time
+
+                completed_uris: set[str] = set()
+                max_inactivity = 0.0
+
+                with self._close_condition:
+                    for uri in list(pending_uris):
+                        future = futures_by_uri[uri]
+                        if future.done():
+                            path = path_by_uri[uri]
+                            state = self.opened_files[path]
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                state.error = {"message": str(exc)}
+                                state.processing = False
+                                state.complete = True
+                                state.last_activity = current_time
+                                completed_uris.add(uri)
+                                continue
+
+                            state.wait_for_diag_done = True
+                            if state.is_ready(current_time):
+                                state.complete = True
+                                completed_uris.add(uri)
+
+                    any_rpc_pending = False
+                    for uri in pending_uris - completed_uris:
+                        path = path_by_uri[uri]
+                        state = self.opened_files[path]
+
+                        if state.is_ready(current_time):
+                            state.complete = True
+                            completed_uris.add(uri)
+                        else:
+                            inactivity = current_time - state.last_activity
+                            max_inactivity = max(max_inactivity, inactivity)
+                            any_rpc_pending = (
+                                any_rpc_pending or not futures_by_uri[uri].done()
+                            )
+
+                    pending_uris.difference_update(completed_uris)
+
+                    if not pending_uris:
+                        return True
+
+                    if self.process.poll() is not None:
+                        logger.warning(
+                            "_wait_for_diagnostics: LSP process exited (%.1fs total).",
+                            total_elapsed,
+                        )
+                        return False
+
+                    if total_elapsed > max_timeout:
+                        logger.warning(
+                            "_wait_for_diagnostics hit max timeout of %.1fs (%.1fs total).",
+                            max_timeout,
+                            total_elapsed,
+                        )
+                        return False
+
+                    if max_inactivity > inactivity_timeout and not any_rpc_pending:
+                        logger.warning(
+                            "_wait_for_diagnostics timed out after %.1fs of inactivity (%.1fs total).",
+                            inactivity_timeout,
+                            total_elapsed,
+                        )
+                        return False
+
+                    self._close_condition.wait(timeout=0.005)
+
             return False
+        finally:
+            cleanup_wait_futures()
 
-    return getattr(process, "returncode", None) is None
+    def get_diagnostics(
+        self,
+        path: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        inactivity_timeout: float = 15.0,
+        max_timeout: float = 300.0,
+    ) -> BaseDiagnosticsResult:
+        """Return diagnostics with an explicit timed_out flag.
+
+        The upstream leanclient result tracks timeout only indirectly via
+        `success=False`. For agentic callers that need to distinguish "file has
+        errors" from "Lean stopped responding in time", attach `timed_out`
+        directly to the returned DiagnosticsResult instance.
+        """
+        if start_line is not None and end_line is not None and start_line > end_line:
+            raise ValueError("start_line must be <= end_line")
+
+        use_range = start_line is not None or end_line is not None
+
+        with self._opened_files_lock:
+            need_to_open = path not in self.opened_files
+
+        if need_to_open:
+            self.open_files([path])
+
+        with self._opened_files_lock:
+            state = self.opened_files[path]
+            if use_range:
+                is_complete = (
+                    state.is_line_range_complete(start_line, end_line)
+                    and state.is_ready()
+                )
+            else:
+                is_complete = state.complete
+            uri = state.uri
+
+        wait_completed = True
+        if not is_complete:
+            if use_range:
+                wait_completed = self._wait_for_line_range(
+                    [uri], start_line, end_line, inactivity_timeout
+                )
+            else:
+                wait_completed = self._wait_for_diagnostics(
+                    [uri],
+                    inactivity_timeout=inactivity_timeout,
+                    max_timeout=max_timeout,
+                )
+
+        with self._opened_files_lock:
+            state = self.opened_files[path]
+
+            if state.error:
+                return self._with_timed_out_flag(
+                    BaseDiagnosticsResult(
+                        success=False,
+                        diagnostics=[state.error],
+                    ),
+                    timed_out=not wait_completed,
+                )
+
+            has_errors = any(d.get("severity") == 1 for d in state.diagnostics)
+            success = not has_errors and not state.fatal_error and wait_completed
+
+            if state.diagnostics:
+                filtered = (
+                    state.filter_diagnostics_by_range(start_line, end_line)
+                    if use_range
+                    else state.diagnostics
+                )
+                return self._with_timed_out_flag(
+                    BaseDiagnosticsResult(
+                        success=success,
+                        diagnostics=filtered,
+                    ),
+                    timed_out=not wait_completed,
+                )
+
+            if state.fatal_error:
+                return self._with_timed_out_flag(
+                    BaseDiagnosticsResult(
+                        success=False,
+                        diagnostics=[
+                            {
+                                "message": "leanclient: Received LeanFileProgressKind.fatalError."
+                            }
+                        ],
+                    ),
+                    timed_out=not wait_completed,
+                )
+
+            return self._with_timed_out_flag(
+                BaseDiagnosticsResult(
+                    success=wait_completed,
+                    diagnostics=[],
+                ),
+                timed_out=not wait_completed,
+            )
 
 
-def _close_client(client: LeanLSPClient, message: str) -> None:
+def _close_client_quietly(client: LeanLSPClient | None) -> None:
+    if client is None:
+        return
     try:
         client.close()
     except Exception:
-        logger.exception(message)
+        logger.exception("Lean client close failed")
 
 
-def bind_lean_project_path(ctx: Context, project_path: Path | str) -> Path:
-    lifespan = ctx.request_context.lifespan_context
-    resolved_project = require_lean_project_path(project_path)
-    current_root: Path | None = getattr(lifespan, "lean_project_path", None)
-    if current_root is not None:
-        current_root = current_root.resolve(strict=False)
-
-    if (
-        current_root is not None
-        and current_root != resolved_project
-        and not _project_switching_allowed(ctx)
-    ):
-        raise ValueError(
-            f"Project switching is disabled for `{_active_transport(ctx)}` transport. "
-            "Restart the server with LEAN_PROJECT_PATH set to the desired Lean project root."
-        )
-
-    if current_root != resolved_project:
-        lifespan.lean_project_path = resolved_project
-        current_client: LeanLSPClient | None = getattr(lifespan, "client", None)
-        if (
-            current_client is not None
-            and getattr(current_client, "project_path", None) != resolved_project
-        ):
-            lifespan.client = None
-
-    return resolved_project
-
-
-def get_path_policy(ctx: Context, project_path: Path | None = None) -> LeanPathPolicy:
-    lifespan = ctx.request_context.lifespan_context
-    root = project_path or getattr(lifespan, "lean_project_path", None)
-    if root is None:
-        raise ValueError("lean project path is not set.")
-    return build_lean_path_policy(root)
-
-
-def _start_client(project_path: Path) -> LeanLSPClient:
-    prevent_cache = bool(os.environ.get("LEAN_LSP_TEST_MODE"))
-    try:
-        with OutputCapture() as output:
-            client = LeanLSPClient(
-                project_path,
-                initial_build=False,
-                prevent_cache_get=prevent_cache,
-                max_opened_files=_max_opened_files(),
-            )
-            logger.info("Shared LSP client connected at %s", project_path)
-        build_output = output.get_output()
-        if build_output:
-            logger.debug("Build output: %s", build_output)
-    except Exception as exc:
-        logger.exception("Failed to start shared Lean LSP client")
-        raise ValueError(
-            f"Failed to start Lean language server at '{project_path}': {exc}"
-        ) from exc
-    return client
-
-
-def _evict_oldest_client() -> None:
-    """Close and remove the oldest shared client to stay within the cap."""
-    oldest_key = next(iter(_shared_clients))
-    old = _shared_clients.pop(oldest_key)
-    _close_client(old, f"Evicted shared client for {oldest_key}")
-
-
-def _get_or_create_shared_client(lean_project_path: Path) -> LeanLSPClient:
-    project_key = lean_project_path.resolve(strict=False)
-
-    if project_key in _builds_in_progress:
-        raise ValueError(
-            "A project build is in progress. Retry after the build completes."
-        )
-
-    client = _shared_clients.get(project_key)
-    if client is not None and _client_is_alive(client):
-        return client
-
-    if client is not None:
-        _shared_clients.pop(project_key, None)
-        _close_client(client, "Shared Lean client close failed during restart")
-
-    if len(_shared_clients) >= _MAX_SHARED_CLIENTS:
-        _evict_oldest_client()
-
-    client = _start_client(project_key)
-    _shared_clients[project_key] = client
-    return client
-
-
-def set_build_in_progress(project_path: Path | str, value: bool) -> None:
-    project_key = Path(project_path).resolve(strict=False)
-    if value:
-        _builds_in_progress.add(project_key)
-    else:
-        _builds_in_progress.discard(project_key)
-
-
-def replace_shared_client(
-    project_path: Path | str, client: LeanLSPClient | None
-) -> LeanLSPClient | None:
-    project_key = Path(project_path).resolve(strict=False)
-    previous = _shared_clients.pop(project_key, None)
-    if client is not None:
-        _shared_clients[project_key] = client
-    return previous
-
-
-def close_shared_client(project_path: Path | str | None = None) -> None:
-    clients: list[LeanLSPClient] = []
-
+def close_shared_client() -> None:
+    """Close the process-wide shared Lean client, if any."""
+    global SHARED_CLIENT, SHARED_CLIENT_PROJECT_PATH
     with CLIENT_LOCK:
-        if project_path is None:
-            clients = list(_shared_clients.values())
-            _shared_clients.clear()
-            _builds_in_progress.clear()
-        else:
-            project_key = Path(project_path).resolve(strict=False)
-            client = _shared_clients.pop(project_key, None)
-            if client is not None:
-                clients.append(client)
-            _builds_in_progress.discard(project_key)
+        _close_client_quietly(SHARED_CLIENT)
+        SHARED_CLIENT = None
+        SHARED_CLIENT_PROJECT_PATH = None
 
-    for client in clients:
-        _close_client(client, "Shared Lean client close failed during shutdown")
+
+def replace_shared_client(project_path: Path, client: LeanLSPClient) -> None:
+    """Replace the process-wide shared Lean client."""
+    global SHARED_CLIENT, SHARED_CLIENT_PROJECT_PATH
+    with CLIENT_LOCK:
+        if SHARED_CLIENT is not None and SHARED_CLIENT is not client:
+            _close_client_quietly(SHARED_CLIENT)
+        SHARED_CLIENT = client
+        SHARED_CLIENT_PROJECT_PATH = project_path.resolve()
 
 
 def startup_client(ctx: Context):
-    """Initialize the Lean LSP client if not already set up."""
+    """Initialize the Lean LSP client if not already set up.
+
+    Args:
+        ctx (Context): Context object.
+    """
+    global SHARED_CLIENT, SHARED_CLIENT_PROJECT_PATH
     with CLIENT_LOCK:
         configured_root = ctx.request_context.lifespan_context.lean_project_path
         if configured_root is None:
             raise ValueError("lean project path is not set.")
-        lean_project_path = bind_lean_project_path(ctx, configured_root)
-        client = _get_or_create_shared_client(lean_project_path)
+        lean_project_path = lean_project_path.resolve()
+
+        session_client: LeanLSPClient | None = ctx.request_context.lifespan_context.client
+
+        # Reattach any already-running shared client for this project.
+        if SHARED_CLIENT is not None and SHARED_CLIENT_PROJECT_PATH == lean_project_path:
+            ctx.request_context.lifespan_context.client = SHARED_CLIENT
+            return
+
+        # Drop any stale session-local client handle that is not the shared one.
+        if session_client is not None and session_client is not SHARED_CLIENT:
+            _close_client_quietly(session_client)
+
+        # Different project path - replace the shared client entirely.
+        if SHARED_CLIENT is not None and SHARED_CLIENT_PROJECT_PATH != lean_project_path:
+            _close_client_quietly(SHARED_CLIENT)
+            SHARED_CLIENT = None
+            SHARED_CLIENT_PROJECT_PATH = None
+
+        # Need to create a new client
+        # In test environments, prevent repeated cache downloads
+        prevent_cache = bool(os.environ.get("LEAN_LSP_TEST_MODE"))
+        try:
+            with OutputCapture() as output:
+                max_files = int(os.environ.get("LEAN_LSP_MAX_OPEN_FILES", "4"))
+                client = LeanLSPClient(
+                    lean_project_path,
+                    initial_build=False,
+                    prevent_cache_get=prevent_cache,
+                    max_opened_files=max_files,
+                )
+                logger.info(f"Connected to Lean language server at {lean_project_path}")
+            build_output = output.get_output()
+            if build_output:
+                logger.debug(f"Build output: {build_output}")
+        except Exception as e:
+            logger.exception("Failed to start Lean LSP client")
+            raise ValueError(
+                f"Failed to start Lean language server at '{lean_project_path}': {e}"
+            ) from e
+
+        SHARED_CLIENT = client
+        SHARED_CLIENT_PROJECT_PATH = lean_project_path
         ctx.request_context.lifespan_context.client = client
 
 
