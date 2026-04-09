@@ -672,6 +672,8 @@ async def lsp_build(
     """Build the Lean project and restart LSP. Use only if needed (e.g. new imports)."""
     lifespan = ctx.request_context.lifespan_context
     configured_root = lifespan.lean_project_path
+    previous_client = getattr(lifespan, "client", None)
+    previous_client_project = getattr(previous_client, "project_path", None)
 
     if not lean_project_path:
         lean_project_path_obj = configured_root
@@ -683,6 +685,26 @@ async def lsp_build(
             raise LeanToolError(str(exc)) from exc
         if previous_root is not None and previous_root != lean_project_path_obj:
             await _close_repl_for_project_switch(lifespan)
+            detached_client = None
+            if previous_client_project is not None:
+                detached_client = replace_shared_client(previous_client_project, None)
+            clients_to_close = [
+                client
+                for client in (detached_client, previous_client)
+                if client is not None
+            ]
+            seen_client_ids: set[int] = set()
+            for client in clients_to_close:
+                client_id = id(client)
+                if client_id in seen_client_ids:
+                    continue
+                seen_client_ids.add(client_id)
+                try:
+                    client.close()
+                except Exception:
+                    logger.exception(
+                        "Pre-build client close failed during project switch"
+                    )
 
     if lean_project_path_obj is None:
         raise LeanToolError(
@@ -717,8 +739,32 @@ async def _run_build(
         return proc
 
     try:
+        lifespan = ctx.request_context.lifespan_context
+        current_client = getattr(lifespan, "client", None)
+        current_client_project = getattr(current_client, "project_path", None)
+
+        detached_client = None
+        if current_client_project is not None:
+            detached_client = replace_shared_client(current_client_project, None)
+
+        clients_to_close = [
+            client
+            for client in (detached_client, current_client)
+            if client is not None
+        ]
+        seen_client_ids: set[int] = set()
+        for client in clients_to_close:
+            client_id = id(client)
+            if client_id in seen_client_ids:
+                continue
+            seen_client_ids.add(client_id)
+            try:
+                client.close()
+            except Exception:
+                logger.exception("Pre-build client close failed before rebuild")
+
         close_shared_client()
-        ctx.request_context.lifespan_context.client = None
+        lifespan.client = None
 
         if clean:
             await _safe_report_progress(
